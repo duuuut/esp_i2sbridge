@@ -1,19 +1,34 @@
-# wt_p4_i2s_bridge
+# i2s_bridge — USB 声卡 ↔ FPGA
 
-WT9932P4-TINY 当作 I2S 主机，给 NAM3 板子当信号源和录音机。**不需要 codec**。
+WT9932P4-TINY 做成一个 USB 音频设备：**电脑上出现一个扬声器和一个麦克风**，
+声音从 USB 流进 FPGA 的 I2S，处理完再流回电脑。不需要 codec。
 
 ```
-ESP32-P4  ──BCK/WS/SD──►  FPGA i2s_sck / i2s_ws / i2s_sd_in
-          ◄──SD──────────  FPGA i2s_sd_out
+PC ──USB──► output_cb ──► spk_stream ──► I2S TX ──► FPGA i2s_sd_in
+PC ◄──USB── input_cb  ◄── mic_stream ◄── I2S RX ◄── FPGA i2s_sd_out
 ```
 
-FPGA 是从机（`nam_i2s_if.v` 把 BCK/WS 当慢速输入采样），所以时钟由这边产生。
-一个控制器跑**全双工**：同一组 BCK/WS 同时驱动收发，两个方向没有时钟漂移。
+## ⚠️ 延迟 132 ms
 
-## 为什么不用 wt_bsp
+核是 6347 抽样感受野的 WaveNet，输出比输入晚 **6346 个样本 = 132 ms**。
 
-BSP 管的是 RGB 灯、按键、摄像头、USB CDC/UVC，**没有 I2S**。I2S 用的是
-ESP-IDF 自带的 `i2s_std` 驱动，加 BSP 只是多一层依赖。以后想要个状态灯再引。
+- 听成品、处理整段音频、对比效果：**可以**。
+- 一边弹一边监听：**不行**，慢半拍还多。
+
+这是算法本身的结构性延迟，不是 I2S 或 USB 引入的，改桥接代码改不掉。
+
+## USB：全速（FS）
+
+`sdkconfig.defaults` 里 `CONFIG_TINYUSB_RHPORT_FS=y`。P4 有两个独立的 OTG：
+
+| 模式 | 控制器 | PHY | 引脚 |
+|---|---|---|---|
+| **FS（当前）** | OTG 1.1 | FSLS 内部 PHY | **GPIO26 = D-，GPIO27 = D+** |
+| HS | OTG 2.0 | UTMI | 专用封装脚，不映射 GPIO |
+
+选 FS 是因为连接器接在 FS 那组线上。**GPIO26/27 别再拿去驱动别的东西**
+（BSP 的板级初始化把这两个脚当 LCD 背光和复位——如果那块屏在用，USB 会不工作）。
+FS 带宽 12 Mbit/s，单声道 48 kHz 只占 96 KB/s，绰绰有余。
 
 ## 接线
 
@@ -21,60 +36,74 @@ ESP-IDF 自带的 `i2s_std` 驱动，加 BSP 只是多一层依赖。以后想�
 |---|---|---|---|
 | GPIO20 | → | `i2s_sck`（D17） | BCK |
 | GPIO21 | → | `i2s_ws`（E17） | LRCK |
-| GPIO22 | → | `i2s_sd_in`（F18） | 送进去的正弦 |
-| GPIO23 | ← | `i2s_sd_out`（F21） | 模型输出 |
+| GPIO22 | → | `i2s_sd_in`（F18） | 送进核的音频 |
+| GPIO23 | ← | `i2s_sd_out`（F21） | 核的输出 |
 | GND | — | GND | 必须共地 |
 
-**GPIO 20–23 是占位的**，按你手上的 TINY 排针改 `i2s_bridge.c` 顶部那四个
-`#define`。板子上已被占用的有 0/7/8/26/27/35/39–44/51（摄像头、触摸、SD、
-背光、按键、RGB 灯），避开这些即可。
+**GPIO 20–23 是占位的**，按你板上引出的排针改 `main/i2s_bridge.c` 顶部四个
+`#define`。板上已占用：0/7/8/26/27/35/39–44/51（摄像头、触摸、SD、背光、按键、
+RGB 灯）。
 
 ## 格式
 
-| 项 | 值 |
+| 侧 | 格式 |
 |---|---|
-| 标准 | Philips I2S，MSB 先出，WS 跳变后 1 个 BCK 的延迟 |
-| 帧 | 32 位时隙 × 2 声道，BCK = 48 kHz × 64 = **3.072 MHz** |
-| 有效位 | 24 位，放在 32 位时隙的**高 24 位**（低 8 位是填充） |
-| 声道 | FPGA 只取左声道；发送时两边都送同一个样本 |
-| 电平 | 3.3 V LVCMOS |
+| USB | 48 kHz、16 位、**单声道**（描述符里就是这个，核本身也是单声道） |
+| I2S | Philips，32 位时隙，音频在**高 24 位**，BCK = 3.072 MHz |
+| 转换 | `s16 << 15` 进，`>> 15` 出 |
 
-36 倍过采样：FPGA 核心 100 MHz / BCK 3.072 MHz = 32.5，要求是 ≥ 4。
+用 32 位时隙而不是 24 位：FPGA 只读延迟位之后的 24 个 MSB，剩下的填充位无所谓，
+这样两边都不用管“24 位怎么塞进 32 位”的约定。
 
-## 构建
+## 构建与烧写
 
 ```bash
-. $IDF_PATH/export.sh          # 需要 ESP-IDF v5.x 或 v6.x
-cd mcu/wt_p4_i2s_bridge
+. ~/.espressif/v6.1/esp-idf/export.sh
 idf.py set-target esp32p4
 idf.py build flash monitor
 ```
 
-## 输出
+已用 ESP-IDF v6.1 编译通过，零警告，镜像 268 KB（分区余 74%）。
+依赖 `espressif/usb_device_uac`，写在 `main/idf_component.yml`，首次构建自动拉取。
 
-每秒一行：
+## 用起来
+
+烧进去后 USB 口应该出现一个新的音频设备：
+
+```bash
+aplay -l ; arecord -l                 # 确认枚举
+aplay   -D plughw:CARD=xxx,DEV=0 input.wav
+arecord -D plughw:CARD=xxx,DEV=0 -f S16_LE -r 48000 -c 1 -d 10 out.wav
+```
+
+运行中每 5 秒打印一行：
 
 ```
-i2s_bridge: sent 47936  got 47936  rx peak 3158291 (37.6% FS)  rms 2231000
+uac_i2s: spk starved 0  mic short 0  mic dropped 0  buffered 0/0
 ```
 
-怎么看：
-
-| 现象 | 含义 |
+| 字段 | 含义 |
 |---|---|
-| `got` 和 `sent` 同步增长 | I2S 链路和 FPGA 都在跑 |
-| `rx peak` 在几十 % FS，随正弦有起伏 | 核在正常处理 |
-| `rx peak` 恒为 0 | 核没有输出：权重没加载 / KEY2 被按住 / I2S 方向接反 |
-| `rx peak` 顶在 8388607（100% FS） | 核在削顶，`head_scale` 太大或输入过载 |
-| `got` 为 0、`sent` 在涨 | 只发了没收到：`i2s_sd_out` 没接好 |
+| `spk starved` | 主机送来的数据填不满 I2S。有反馈端点反压主机，正常应为 0 |
+| `mic short` | 给主机的是补零，通常是刚上电那 132 ms |
+| `mic dropped` | 缓冲满、主机读得比核生产得慢。**持续不为 0 就是真丢数据** |
+| `buffered` | 两个流缓冲各有多少字节，正常在 0 附近晃说明速率匹配 |
 
-板上电即用：bitstream 里已经带了一份编译时的模型（`wrom.hex`），不需要先传权重。
-要换模型再用 `scripts/upload_weights.py` 从 PC 传。
+## 时钟从哪来
 
-## 两个已知的坑
+两个振荡器：USB 主机一个，P4 的 APLL 一个，差几 ppm。
 
-- **这份代码没有编译过**：写它的机器上没装 ESP-IDF。API 是按 IDF 5.x/6.x 的
-  `i2s_std` 写的；如果全双工那两行报错，说明你的 IDF 版本要求 RX 通道单独
-  配置，把第二个 `i2s_channel_init_std_mode` 换成它建议的形式即可。
-- **正弦是实时算的**（`sin()` 每样本一次，96k 次/秒）。P4 有 FPU，这个开销可以
-  忽略；如果要更省，换成 1024 点查表。
+- **播放方向**有反馈端点（`CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP`，按 FIFO 水位反压
+  主机），主机跟着我们走，不漂。
+- **录音方向**没有反馈，主机按自己的节奏读。这就是 `mic dropped` 存在的原因，
+  2048 样本（43 ms）的缓冲用来吸收它。
+
+## 已知的坑
+
+- **Windows / Linux 的 UAC 描述符不完全兼容**，组件文档明说了；macOS 要开
+  `UAC_SUPPORT_MACOS`。默认面向 Linux/Windows，先在 Linux 上验证。
+- **控制台在 USB Serial/JTAG 上**（`sdkconfig.defaults`）。它是第三个 USB 设备，
+  和 OTG 不是一回事；如果板上只有一个 Type-C 接到了 OTG，日志要挪到 UART。
+- **UAC 是 2.0**（`bcdADC = 0x0200`，组件没有 1.0 选项）。Win10+/Linux 免驱；
+  老主机不认才需要自己写 UAC1 描述符。
+- **`spk_starved` 一直涨**：主机没在播放，核在吃静音，不是错误。

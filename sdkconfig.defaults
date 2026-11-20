@@ -4,3 +4,11 @@ CONFIG_FREERTOS_HZ=1000
 
 # The P4 console is USB Serial/JTAG on this board.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_UAC_SPEAKER_CHANNEL_NUM=1
+CONFIG_UAC_MIC_CHANNEL_NUM=1
+CONFIG_UAC_SAMPLE_RATE=48000
+
+# Full speed on purpose: the FS PHY is the OTG1.1 controller on GPIO26/27, the
+# one wired to the connector on this board.  The HS controller's PHY has no
+# GPIO mapping at all (usb_dwc_periph.c: internal_phy_io = NULL).
+CONFIG_TINYUSB_RHPORT_FS=y
